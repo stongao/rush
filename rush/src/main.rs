@@ -1,5 +1,7 @@
 use std::io::{self, Write};
-use std::process::{Command, Stdio};
+use std::ffi::{CStr, CString};
+use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::{execvp, fork, ForkResult};
 
 fn main() {
     let stdin = io::stdin();
@@ -50,27 +52,50 @@ fn main() {
 
         let args: Vec<&str> = parts.collect();
 
-        // Spawn the command in blocking fashion, inheriting stdio so that
-        // child stdout/stderr are displayed directly
-        let status = Command::new(cmd)
-            .args(&args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status();
-
-        match status {
-            Ok(s) if s.success() => {
-                // Successful execution; nothing to report
+        // Fork and exec the command, inheriting stdio by default
+        // Build C-compatible argv: [cmd, args...]
+        let c_cmd = match CString::new(cmd) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("invalid command name (contains NUL byte)");
+                continue;
             }
-            Ok(s) => {
-                match s.code() {
-                    Some(code) => eprintln!("command exited with code {}", code),
-                    None => eprintln!("command terminated by signal"),
+        };
+        let c_argv_storage: Vec<CString> = std::iter::once(cmd)
+            .chain(args.iter().copied())
+            .map(|s| CString::new(s).unwrap_or_else(|_| CString::new("?").unwrap()))
+            .collect();
+        let argv: Vec<&CStr> = c_argv_storage.iter().map(|s| s.as_c_str()).collect();
+
+        match unsafe { fork() } {
+            Ok(ForkResult::Parent { child }) => {
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, code)) => {
+                        if code != 0 {
+                            eprintln!("command exited with code {}", code);
+                        }
+                    }
+                    Ok(WaitStatus::Signaled(_, _sig, _core)) => {
+                        eprintln!("command terminated by signal");
+                    }
+                    Ok(_) => {
+                        // Other wait statuses (stopped/continued) are not expected here
+                    }
+                    Err(err) => {
+                        eprintln!("waitpid error: {}", err);
+                    }
                 }
             }
+            Ok(ForkResult::Child) => {
+                // Child: replace image with the command
+                if let Err(err) = execvp(&c_cmd, &argv) {
+                    eprintln!("failed to execute '{}': {}", cmd, err);
+                    unsafe { libc::_exit(127) };
+                }
+                unreachable!();
+            }
             Err(err) => {
-                eprintln!("failed to execute '{}': {}", cmd, err);
+                eprintln!("fork error: {}", err);
             }
         }
     }
